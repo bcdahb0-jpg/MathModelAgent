@@ -3,6 +3,7 @@
 import os
 import re
 from app.utils.data_recorder import DataRecorder
+from app.utils.log_util import logger
 from app.schemas.A2A import WriterResponse
 import json
 import uuid
@@ -10,6 +11,11 @@ import uuid
 
 class UserOutput:
     """管理建模任务的输出结果，处理引用编号、脚注和最终论文拼接。"""
+
+    # 行内引用标记：{[^1]: 引用内容}，冒号可省略（历史提示词与模型实际输出常写成
+    # {[^1] 引用内容}，用 :? 两者都收，否则引用会被整体丢弃、参考文献章节为空）
+    REFERENCE_PATTERN = r"\{\[\^(\d+)\]\s*:?\s*(.*?)\}"
+
     def __init__(
         self, work_dir: str, ques_count: int, data_recorder: DataRecorder | None = None
     ):
@@ -83,43 +89,21 @@ class UserOutput:
         Returns:
             替换引用为 UUID 后的文本。
         """
-        # 匹配引用内容，格式为 {[^数字]: 引用内容}
-        # 修改正则表达式，匹配大括号包裹的引用格式
-        references = re.findall(r"\{\[\^(\d+)\]:\s*(.*?)\}", text, re.DOTALL)
 
-        for ref_num, ref_content in references:
-            # 清理引用内容，去除末尾的空格和点号
-            ref_content = ref_content.strip().rstrip(".")
+        def _replace(match: re.Match) -> str:
+            # 清理引用内容，去除首尾空白和末尾的点号
+            ref_content = match.group(2).strip().rstrip(".")
 
-            # 检查当前引用内容是否已经存在于footnotes中
-            existing_uuid = None
+            # 引用内容重复时复用已有的 UUID，保证同一文献只出现一次
             for uuid_key, footnote_data in self.footnotes.items():
                 if footnote_data["content"] == ref_content:
-                    existing_uuid = uuid_key
-                    break
+                    return f"[{uuid_key}]"
 
-            if existing_uuid:
-                # 如果已存在，使用现有的UUID
-                text = re.sub(
-                    rf"\{{\[\^{ref_num}\]:.*?\}}",
-                    f"[{existing_uuid}]",
-                    text,
-                    flags=re.DOTALL,
-                )
-            else:
-                # 如果不存在，创建新的UUID和footnote条目
-                new_uuid = str(uuid.uuid4())
-                self.footnotes[new_uuid] = {
-                    "content": ref_content,
-                }
-                text = re.sub(
-                    rf"\{{\[\^{ref_num}\]:.*?\}}",
-                    f"[{new_uuid}]",
-                    text,
-                    flags=re.DOTALL,
-                )
+            new_uuid = str(uuid.uuid4())
+            self.footnotes[new_uuid] = {"content": ref_content}
+            return f"[{new_uuid}]"
 
-        return text
+        return re.sub(self.REFERENCE_PATTERN, _replace, text, flags=re.DOTALL)
 
     def sort_text_with_footnotes(self, replace_res: dict) -> dict:
         """按章节顺序排列文本并将 UUID 替换为连续编号。
@@ -135,14 +119,16 @@ class UserOutput:
 
         for seq_key in self.seq:
             text = replace_res[seq_key]["response_content"]
-            # 找到[uuid]
-            uuid_list = re.findall(r"\[([a-f0-9-]{36})\]", text)
+            # 找到[uuid]（dict.fromkeys 去重且保持出现顺序：同一篇文献多次引用时
+            # 复用同一个编号，不会出现正文编号与文末列表对不上的情况）
+            uuid_list = dict.fromkeys(re.findall(r"\[([a-f0-9-]{36})\]", text))
             for uid in uuid_list:
-                text = text.replace(f"[{uid}]", f"[^{ref_index}]")
                 if self.footnotes[uid].get("number") is None:
                     self.footnotes[uid]["number"] = ref_index
-
-                ref_index += 1
+                    ref_index += 1
+                # 正文里用 [1] 这种「方括号数字」而不是 [^1]：后者在 pandoc/markdown
+                # 里是脚注引用，转 docx 时会变成页脚注释、正文里反而看不到参考文献列表
+                text = text.replace(f"[{uid}]", f"[{self.footnotes[uid]['number']}]")
             sort_res[seq_key] = {
                 "response_content": text,
             }
@@ -156,14 +142,22 @@ class UserOutput:
             text: 论文正文。
 
         Returns:
-            附带参考文献的完整文本。
+            附带参考文献的完整文本。没有引用时原样返回（避免留下一个空标题）。
         """
-        text += "\n\n ## 参考文献"
+        if not self.footnotes:
+            logger.warning("全文未提取到任何引用标记，跳过「参考文献」章节")
+            return text
+
         # 将脚注转换为列表并按 number 排序
-        sorted_footnotes = sorted(self.footnotes.items(), key=lambda x: x[1]["number"])
-        for _, footnote in sorted_footnotes:
-            text += f"\n\n[^{footnote['number']}]: {footnote['content']}"
-        return text
+        sorted_footnotes = sorted(
+            self.footnotes.items(), key=lambda x: x[1].get("number") or 0
+        )
+        entries = [
+            f"[{footnote['number']}] {footnote['content']}"
+            for _, footnote in sorted_footnotes
+        ]
+        # 条目之间空行分隔：pandoc 会把相邻行合并成同一段，空行才能保证一条一段
+        return text + "\n\n## 参考文献\n\n" + "\n\n".join(entries)
 
     def get_result_to_save(self) -> str:
         """获取最终拼接的论文全文，包含引用处理和参考文献。"""

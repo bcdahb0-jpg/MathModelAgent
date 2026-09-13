@@ -1,9 +1,12 @@
 """LLM 交互模块，封装大语言模型的调用、重试和消息发送。"""
 
+import asyncio
 from typing import Any
+
+from openai import APIStatusError
+
 from app.utils.common_utils import transform_link, split_footnotes
 from app.utils.log_util import logger
-import time
 from app.schemas.response import (
     CoderMessage,
     WriterMessage,
@@ -101,11 +104,23 @@ class LLM:
                 await self.send_message(response, agent_name, sub_title)
                 return response
             except Exception as e:
+                # 4xx（除 429 限流外）属于请求本身不合法——重试多少次结果都一样，
+                # 立刻上抛，避免把一次 400 刷成几十条日志并把任务卡死。
+                if (
+                    isinstance(e, APIStatusError)
+                    and 400 <= e.status_code < 500
+                    and e.status_code != 429
+                ):
+                    logger.error(f"请求被服务端拒绝（HTTP {e.status_code}），不再重试: {str(e)}")
+                    raise
+
                 attempt += 1
                 logger.error(f"第{attempt}次重试: {str(e)}")
                 if max_retries is not None and attempt >= max_retries:
                     raise
-                time.sleep(retry_delay * min(attempt, 10))
+                # 用 asyncio.sleep 而不是 time.sleep，否则重试等待期间会阻塞事件循环，
+                # 任务的「停止」信号无法生效
+                await asyncio.sleep(retry_delay * min(attempt, 10))
 
     def _validate_and_fix_tool_calls(self, history: list) -> list:
         """验证并修复工具调用完整性。"""
